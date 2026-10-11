@@ -23,6 +23,7 @@ let package = Package(
             ],
             linkerSettings: [
                 .linkedLibrary("dl"),
+                .linkedLibrary("bz2"),
             ]
         ),
         .target(

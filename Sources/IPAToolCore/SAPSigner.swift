@@ -42,13 +42,14 @@ public class SAPSigner {
                       certificateURL: URL, setupURL: URL) async throws {
         guard signer == nil else { return }
 
-        // 加载 libunicorn
-        guard let unicornPath = Self.findUnicornDylib() else {
-            throw SAPError.creationFailed
-        }
+        // 确保 unicorn dylib 已下载
+        let unicornPath = try await SAPAssetDownloader.ensureUnicornLibrary()
         guard csap_uc_load(unicornPath) == 0 else {
             throw SAPError.creationFailed
         }
+
+        // 确保 SAP 资产已下载
+        try await SAPAssetDownloader.ensureSAPAssets()
 
         // 加载资产
         let coreFP = try assets.load(.coreFP)
