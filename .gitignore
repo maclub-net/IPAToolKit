@@ -1,0 +1,15 @@
+# Xcode
+.DS_Store
+*.xcuserstate
+*.xcscmblueprint
+DerivedData/
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# Swift
+*.swiftmodule
+*.swiftdoc
+*.swiftsourceinfo
