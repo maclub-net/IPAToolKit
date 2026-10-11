@@ -215,25 +215,33 @@ public enum SAPAssetDownloader {
         let path: String  // CPIO 内路径
         let size: Int
         let sha256: String
+        let cacheSubdir: String  // 缓存子目录（相对于 SAPAssets.cacheRoot）
     }
 
     private static let requiredSAPFiles: [SAPFileSpec] = [
-        SAPFileSpec(name: "CommerceKit", path: "./System/Library/PrivateFrameworks/CommerceKit.framework/Versions/A/CommerceKit", size: 3271840, sha256: "b84ff12c21987856c0a17b78f1ad82b73195a6dec5f3b208a17d245555a2c8a2"),
-        SAPFileSpec(name: "CommerceCore", path: "./System/Library/PrivateFrameworks/CommerceKit.framework/Versions/A/Frameworks/CommerceCore.framework/Versions/A/CommerceCore", size: 207744, sha256: "c5401e57402230f3c876409d295319ddf1e61287bc882683c5d61277be7bc1f2"),
-        SAPFileSpec(name: "CoreFP", path: "./System/Library/PrivateFrameworks/CoreFP.framework/Versions/A/CoreFP", size: 29014912, sha256: "f19141336be4198d0f8991bb00017c915efc7aeaece36c345f7faa1237ea6074"),
-        SAPFileSpec(name: "CoreFP.icxs", path: "./System/Library/PrivateFrameworks/CoreFP.framework/Versions/A/CoreFP.icxs", size: 5288352, sha256: "473e78af86979f5bd4f6269561caf770b3d16c098d918846eeac8cdd2fe6566a"),
-        SAPFileSpec(name: "storeagent", path: "./System/Library/PrivateFrameworks/CommerceKit.framework/Versions/A/Resources/storeagent", size: 2580176, sha256: "70ce036f9dbcbc04db9511ebd08de0dd3cbc35ccc9d44b089c90170cb5453c59"),
+        SAPFileSpec(name: "CommerceKit", path: "./System/Library/PrivateFrameworks/CommerceKit.framework/Versions/A/CommerceKit", size: 3271840, sha256: "b84ff12c21987856c0a17b78f1ad82b73195a6dec5f3b208a17d245555a2c8a2", cacheSubdir: "apple-assets-v2"),
+        SAPFileSpec(name: "CommerceCore", path: "./System/Library/PrivateFrameworks/CommerceKit.framework/Versions/A/Frameworks/CommerceCore.framework/Versions/A/CommerceCore", size: 207744, sha256: "c5401e57402230f3c876409d295319ddf1e61287bc882683c5d61277be7bc1f2", cacheSubdir: "apple-assets-v2"),
+        SAPFileSpec(name: "CoreFP", path: "./System/Library/PrivateFrameworks/CoreFP.framework/Versions/A/CoreFP", size: 29014912, sha256: "f19141336be4198d0f8991bb00017c915efc7aeaece36c345f7faa1237ea6074", cacheSubdir: "apple-assets-v2"),
+        SAPFileSpec(name: "CoreFP.icxs", path: "./System/Library/PrivateFrameworks/CoreFP.framework/Versions/A/CoreFP.icxs", size: 5288352, sha256: "473e78af86979f5bd4f6269561caf770b3d16c098d918846eeac8cdd2fe6566a", cacheSubdir: "apple-assets-v2"),
+        SAPFileSpec(name: "storeagent", path: "./System/Library/PrivateFrameworks/CommerceKit.framework/Versions/A/Resources/storeagent", size: 2580176, sha256: "70ce036f9dbcbc04db9511ebd08de0dd3cbc35ccc9d44b089c90170cb5453c59", cacheSubdir: "apple-storeagent-v1"),
     ]
+
+    /// 获取指定 spec 的缓存文件 URL
+    private static func cacheURL(for spec: SAPFileSpec) -> URL {
+        let cacheRoot = SAPAssets.cacheRoot
+        return cacheRoot
+            .appendingPathComponent(spec.cacheSubdir, isDirectory: true)
+            .appendingPathComponent(spec.name)
+    }
 
     /// 确保所有 SAP 资产已下载到缓存目录
     public static func ensureSAPAssets() async throws {
-        let cacheDir = SAPAssets.defaultCacheDirectory
         let fm = FileManager.default
 
         // 检查是否所有文件都已缓存且校验通过
         var allCached = true
         for spec in requiredSAPFiles {
-            let fileURL = cacheDir.appendingPathComponent(spec.name)
+            let fileURL = cacheURL(for: spec)
             guard fm.fileExists(atPath: fileURL.path),
                   let attrs = try? fm.attributesOfItem(atPath: fileURL.path),
                   let fileSize = attrs[.size] as? Int,
@@ -248,8 +256,6 @@ public enum SAPAssetDownloader {
             return
         }
 
-        try fm.createDirectory(at: cacheDir, withIntermediateDirectories: true)
-
         print("[sap-assets] downloading from Apple package...")
         let files = try await downloadSAPAssets()
 
@@ -260,7 +266,8 @@ public enum SAPAssetDownloader {
             guard data.count == spec.size, sha256(of: data) == spec.sha256 else {
                 throw SAPDownloadError.checksumMismatch
             }
-            let fileURL = cacheDir.appendingPathComponent(spec.name)
+            let fileURL = cacheURL(for: spec)
+            try fm.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             try data.write(to: fileURL, options: .atomic)
             print("[sap-assets] cached \(spec.name) (\(data.count) bytes)")
         }

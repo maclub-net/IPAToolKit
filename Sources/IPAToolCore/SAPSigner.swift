@@ -369,18 +369,31 @@ public struct SAPAssets {
     }
 
     public func load(_ type: AssetType) throws -> Data {
-        let url = directory.appendingPathComponent(type.rawValue)
+        let url: URL
+        if type == .storeagent {
+            // storeagent 单独存放在 apple-storeagent-v1 目录
+            url = SAPAssets.cacheRoot
+                .appendingPathComponent("apple-storeagent-v1")
+                .appendingPathComponent(type.rawValue)
+        } else {
+            url = directory.appendingPathComponent(type.rawValue)
+        }
         return try Data(contentsOf: url)
     }
 
     public static var defaultCacheDirectory: URL {
+        cacheRoot.appendingPathComponent("apple-assets-v2")
+    }
+
+    /// SAP 资产缓存根目录（.../Library/Caches/ipatool/sap/）
+    public static var cacheRoot: URL {
         #if os(macOS)
         let home = FileManager.default.homeDirectoryForCurrentUser
-        return home.appendingPathComponent("Library/Caches/ipatool/sap/apple-assets-v2")
+        return home.appendingPathComponent("Library/Caches/ipatool/sap")
         #else
         let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
-        return caches.appendingPathComponent("ipatool/sap/apple-assets-v2")
+        return caches.appendingPathComponent("ipatool/sap")
         #endif
     }
 }
