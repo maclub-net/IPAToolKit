@@ -10,6 +10,14 @@ IPAToolKit is the core library powering [IPATool](https://github.com/maclub-net/
 
 The library is extracted as a standalone Swift Package so that both the IPATool macOS app and other projects (e.g. [APParse](https://github.com/maclub-net/APParse)) can share the same App Store client and decryption logic.
 
+## Who uses IPAToolKit
+
+### [IPATool](https://github.com/maclub-net/ipatool)
+
+A native macOS desktop app for searching the App Store, managing multi-region Apple IDs, and downloading IPA packages. IPATool is the primary consumer of IPAToolKit — every feature from search and login to macOS package decryption is built on top of this library.
+
+[![IPATool Screenshot](https://raw.githubusercontent.com/maclub-net/ipatool/main/Screenshots/app.png)](https://github.com/maclub-net/ipatool)
+
 ## Features
 
 - **App Store Search**: Search apps by keyword with platform filters (iPhone, iPad, Apple TV, visionOS, macOS).
