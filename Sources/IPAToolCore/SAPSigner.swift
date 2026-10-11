@@ -89,8 +89,9 @@ public class SAPSigner {
         }
         print("[SAP] signer created: \(s)")
 
-        // 用局部变量持有，全部成功后才赋值给 self.signer
-        // 这样任何中途失败都不会让 self.signer 处于半初始化状态
+        // 临时赋值，exchange 需要访问 self.signer
+        // 如果中途失败，在 catch 中释放并置 nil
+        self.signer = s
         do {
             // 获取证书
             let certificate = try await fetchCertificate(from: certificateURL)
@@ -126,12 +127,11 @@ public class SAPSigner {
                 throw SAPError.setupFailed(state: state)
             }
             print("[SAP] setup complete")
-
-            // 全部成功，才赋值
-            self.signer = s
+            // setup 成功，self.signer 保持赋值
         } catch {
             // 中途失败：释放 signer，卸载 unicorn，允许重试
             csap_signer_free(s)
+            self.signer = nil
             csap_uc_unload()
             throw error
         }
