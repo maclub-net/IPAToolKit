@@ -83,45 +83,58 @@ public class SAPSigner {
         }
 
         guard let s = created else {
+            // 失败时卸载 unicorn，允许重试
+            csap_uc_unload()
             throw SAPError.creationFailed
         }
-        self.signer = s
         print("[SAP] signer created: \(s)")
 
-        // 获取证书
-        let certificate = try await fetchCertificate(from: certificateURL)
-        print("[SAP] certificate fetched, \(certificate.count) bytes")
+        // 用局部变量持有，全部成功后才赋值给 self.signer
+        // 这样任何中途失败都不会让 self.signer 处于半初始化状态
+        do {
+            // 获取证书
+            let certificate = try await fetchCertificate(from: certificateURL)
+            print("[SAP] certificate fetched, \(certificate.count) bytes")
 
-        // 第一次 exchange
-        var setupRequest: Data?
-        var state: Int32 = 0
-        try exchange(input: certificate) { output, result in
-            setupRequest = output
-            state = result
-        }
-        print("[SAP] exchange #1 state=\(state), output=\(setupRequest?.count ?? 0) bytes")
+            // 第一次 exchange
+            var setupRequest: Data?
+            var state: Int32 = 0
+            try exchange(input: certificate) { output, result in
+                setupRequest = output
+                state = result
+            }
+            print("[SAP] exchange #1 state=\(state), output=\(setupRequest?.count ?? 0) bytes")
 
-        guard state == 1 else {
-            throw SAPError.setupFailed(state: state)
-        }
-        guard let request = setupRequest, !request.isEmpty else {
-            throw SAPError.emptySetupRequest
-        }
+            guard state == 1 else {
+                throw SAPError.setupFailed(state: state)
+            }
+            guard let request = setupRequest, !request.isEmpty else {
+                throw SAPError.emptySetupRequest
+            }
 
-        // 发送 setup 请求
-        let reply = try await sendSetupRequest(to: setupURL, request: request)
-        print("[SAP] setup reply received, \(reply.count) bytes")
+            // 发送 setup 请求
+            let reply = try await sendSetupRequest(to: setupURL, request: request)
+            print("[SAP] setup reply received, \(reply.count) bytes")
 
-        // 第二次 exchange
-        try exchange(input: reply) { _, result in
-            state = result
-        }
-        print("[SAP] exchange #2 state=\(state)")
+            // 第二次 exchange
+            try exchange(input: reply) { _, result in
+                state = result
+            }
+            print("[SAP] exchange #2 state=\(state)")
 
-        guard state == 0 else {
-            throw SAPError.setupFailed(state: state)
+            guard state == 0 else {
+                throw SAPError.setupFailed(state: state)
+            }
+            print("[SAP] setup complete")
+
+            // 全部成功，才赋值
+            self.signer = s
+        } catch {
+            // 中途失败：释放 signer，卸载 unicorn，允许重试
+            csap_signer_free(s)
+            csap_uc_unload()
+            throw error
         }
-        print("[SAP] setup complete")
     }
 
     /// 签名数据
