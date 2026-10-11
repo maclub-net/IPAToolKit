@@ -274,7 +274,7 @@ public class SAPSigner {
         }
 
         guard ret == 0 else {
-            print("[SAP] exchange failed: ret=\(ret)")
+            print("[SAP] exchange failed: ret=\(ret), input=\(input.count) bytes")
             throw SAPError.exchangeFailed
         }
 
