@@ -222,6 +222,7 @@ public enum SAPAssetDownloader {
         SAPFileSpec(name: "CommerceCore", path: "./System/Library/PrivateFrameworks/CommerceKit.framework/Versions/A/Frameworks/CommerceCore.framework/Versions/A/CommerceCore", size: 207744, sha256: "c5401e57402230f3c876409d295319ddf1e61287bc882683c5d61277be7bc1f2"),
         SAPFileSpec(name: "CoreFP", path: "./System/Library/PrivateFrameworks/CoreFP.framework/Versions/A/CoreFP", size: 29014912, sha256: "f19141336be4198d0f8991bb00017c915efc7aeaece36c345f7faa1237ea6074"),
         SAPFileSpec(name: "CoreFP.icxs", path: "./System/Library/PrivateFrameworks/CoreFP.framework/Versions/A/CoreFP.icxs", size: 5288352, sha256: "473e78af86979f5bd4f6269561caf770b3d16c098d918846eeac8cdd2fe6566a"),
+        SAPFileSpec(name: "storeagent", path: "./System/Library/PrivateFrameworks/CommerceKit.framework/Versions/A/Resources/storeagent", size: 2580176, sha256: "70ce036f9dbcbc04db9511ebd08de0dd3cbc35ccc9d44b089c90170cb5453c59"),
     ]
 
     /// 确保所有 SAP 资产已下载到缓存目录
