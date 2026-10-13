@@ -209,6 +209,9 @@ public enum SAPAssetDownloader {
 
     // Payload 中 bzip2 数据起始偏移
     private static let payloadBZOffset: Int64 = 0x352F40D5
+    // 解压后需跳过的字节数：bz2 切点落在某个 CPIO 条目中间，
+    // 跳过 0x3A4 字节后才对齐到第一个完整 CPIO 头（对齐上游 ipadecrypt）
+    private static let payloadCPIPSkip = 0x3A4
 
     struct SAPFileSpec {
         let name: String
@@ -348,9 +351,14 @@ public enum SAPAssetDownloader {
         }
         let cpioData = Data(bytesNoCopy: ptr, count: outputLen, deallocator: .free)
         print("[sap-assets] CPIO size: \(cpioData.count) bytes")
+        guard cpioData.count > payloadCPIPSkip else {
+            print("[sap-assets] CPIO data too short: \(cpioData.count)")
+            throw SAPDownloadError.extractionFailed
+        }
 
-        // 7. 解析 CPIO，提取 4 个文件
-        let files = extractCPIOEntries(cpioData, wantedPaths: Set(requiredSAPFiles.map { $0.path }))
+        // 7. 跳过切点残留字节后解析 CPIO，提取 5 个文件
+        let files = extractCPIOEntries(cpioData.subdata(in: payloadCPIPSkip..<cpioData.count),
+                                       wantedPaths: Set(requiredSAPFiles.map { $0.path }))
         print("[sap-assets] extracted \(files.count)/\(requiredSAPFiles.count) files")
         return files
     }
