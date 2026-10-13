@@ -317,6 +317,10 @@ public enum SAPAssetDownloader {
             throw SAPDownloadError.extractionFailed
         }
         print("[sap-assets] Payload offset=\(payload.offset) size=\(payload.size)")
+        guard payload.size > Int(payloadBZOffset) else {
+            print("[sap-assets] Payload too small for bz2 offset: \(payload.size) <= \(payloadBZOffset)")
+            throw SAPDownloadError.extractionFailed
+        }
 
         let heapOffset = 28 + tocCompressedSize
         let payloadHeapOffset = heapOffset + payload.offset
@@ -517,9 +521,11 @@ class XARPayloadParser: NSObject, XMLParserDelegate {
     func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName qName: String?) {
         if elementName == "data" {
             inData = false
+            // XAR 中可能存在多个 Payload 条目（主包与子组件），取 size 最大的主 Payload
             if currentFile == "Payload",
                let offsetStr = currentData["offset"], let offset = Int(offsetStr),
-               let sizeStr = currentData["size"], let size = Int(sizeStr) {
+               let sizeStr = currentData["size"], let size = Int(sizeStr),
+               size > (payload?.size ?? 0) {
                 payload = SAPAssetDownloader.XARFile(offset: offset, size: size)
             }
             currentFile = ""
