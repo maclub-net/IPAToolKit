@@ -57,6 +57,12 @@ int csap_bz2_decompress(const uint8_t* compressed, size_t compressed_len,
             BZ2_bzDecompressEnd(&strm);
             return -5;
         }
+        // 输入是分片下载的截断流：avail_in 耗尽但无 STREAM_END 时，
+        // bz2 会返回 BZ_OK 且不再产生输出，继续循环将空转死锁，
+        // 此时返回已解压的部分数据即可（调用方只取前面的 CPIO 条目）
+        if (strm.avail_in == 0) {
+            break;
+        }
     }
 
     BZ2_bzDecompressEnd(&strm);
