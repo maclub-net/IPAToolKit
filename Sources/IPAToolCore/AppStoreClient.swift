@@ -1276,6 +1276,11 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
 
 
         guard httpResponse.statusCode == 200 else {
+            // 401/403 表示 token 过期或失效，抛出 notAuthenticated
+            // 让上层 withTokenRefresh 自动刷新令牌并重试
+            if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
+                throw AppStoreError.notAuthenticated
+            }
             throw AppStoreError.downloadFailed(message: "DAAP request failed with HTTP \(httpResponse.statusCode)")
         }
         return data
