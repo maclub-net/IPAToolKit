@@ -502,9 +502,14 @@ class XARPayloadParser: NSObject, XMLParserDelegate {
 
     func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?, qualifiedName qName: String?, attributes attributeDict: [String: String] = [:]) {
         currentElement = elementName
-        if elementName == "data" {
-            inData = true
+        if elementName == "file" {
+            // 每个 <file> 开始时重置状态：<data> 在 <name> 之前出现，
+            // 必须在 </file> 时才能把名字和数据关联起来
+            currentFile = ""
             currentData = [:]
+            inData = false
+        } else if elementName == "data" {
+            inData = true
         }
     }
 
@@ -521,6 +526,7 @@ class XARPayloadParser: NSObject, XMLParserDelegate {
     func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName qName: String?) {
         if elementName == "data" {
             inData = false
+        } else if elementName == "file" {
             // XAR 中可能存在多个 Payload 条目（主包与子组件），取 size 最大的主 Payload
             if currentFile == "Payload",
                let offsetStr = currentData["offset"], let offset = Int(offsetStr),
@@ -528,7 +534,6 @@ class XARPayloadParser: NSObject, XMLParserDelegate {
                size > (payload?.size ?? 0) {
                 payload = SAPAssetDownloader.XARFile(offset: offset, size: size)
             }
-            currentFile = ""
         }
         currentElement = ""
     }
