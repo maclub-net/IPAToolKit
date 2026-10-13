@@ -287,9 +287,16 @@ public enum SAPAssetDownloader {
             throw SAPDownloadError.extractionFailed
         }
 
-        let tocCompressedSize = headerData.withUnsafeBytes { Int($0.loadUnaligned(fromByteOffset: 4, as: UInt64.self).bigEndian) }
-        let tocUncompressedSize = headerData.withUnsafeBytes { Int($0.loadUnaligned(fromByteOffset: 12, as: UInt64.self).bigEndian) }
+        // XAR header 布局：magic(4) + headerSize(2) + version(2)
+        // + tocCompressed(8) + tocUncompressed(8) + cksumType(4)，均为大端
+        let tocCompressedSize = headerData.withUnsafeBytes { Int($0.loadUnaligned(fromByteOffset: 8, as: UInt64.self).bigEndian) }
+        let tocUncompressedSize = headerData.withUnsafeBytes { Int($0.loadUnaligned(fromByteOffset: 16, as: UInt64.self).bigEndian) }
         print("[sap-assets] XAR header ok, TOC compressed=\(tocCompressedSize) uncompressed=\(tocUncompressedSize)")
+        guard tocCompressedSize > 0, tocCompressedSize < 10 * 1024 * 1024,
+              tocUncompressedSize > 0, tocUncompressedSize < 100 * 1024 * 1024 else {
+            print("[sap-assets] TOC sizes out of sane range, header parse failed")
+            throw SAPDownloadError.extractionFailed
+        }
 
         // 2. 下载压缩的 TOC
         let tocCompressed = try await downloadRange(from: 28, length: tocCompressedSize)
