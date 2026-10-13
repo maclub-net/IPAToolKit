@@ -404,7 +404,6 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
         request.httpBody = bodyData
 
         print("[login] POST \(authEndpoint.absoluteString)")
-        print("[login] signature length: \(signatureB64.count)")
 
         var currentRequest = request
         var data = Data()
@@ -421,7 +420,6 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
             if (300...399).contains(http.statusCode),
                let location = http.value(forHTTPHeaderField: "Location"),
                let redirectURL = URL(string: location, relativeTo: currentRequest.url) {
-                print("[login] redirect \(http.statusCode) -> \(redirectURL.absoluteString)")
                 currentRequest.url = redirectURL
                 currentRequest.httpBody = bodyData
                 continue
@@ -431,10 +429,6 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
 
         guard let httpResponse = httpResponse else {
             throw AppStoreError.invalidResponse
-        }
-        print("[login] HTTP \(httpResponse.statusCode)")
-        if let bodyStr = String(data: data, encoding: .utf8) {
-            print("[login] response (\(data.count) bytes): \(bodyStr.prefix(3000))")
         }
 
         guard let dict = parsePlistResponse(data) else {
@@ -465,8 +459,6 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
         // 从响应头提取 storefront 和 pod
         let storeFront = httpResponse.value(forHTTPHeaderField: "X-Set-Apple-Store-Front") ?? ""
         let pod = httpResponse.value(forHTTPHeaderField: "pod") ?? ""
-        print("[login] all headers: \(httpResponse.allHeaderFields)")
-        print("[login] storeFront=\(storeFront), pod=\(pod)")
 
         let accountInfo = dict["accountInfo"] as? [String: Any]
         let firstName = accountInfo?["firstName"] as? String ?? ""
@@ -483,7 +475,7 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
         )
         self.account = acc
 
-        print("[login] SUCCESS: \(acc.name), storefront=\(storeFront), pod=\(pod)")
+        print("[login] SUCCESS: \(acc.name)")
         return acc
     }
 
@@ -691,9 +683,9 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
         guard let httpResponse = response as? HTTPURLResponse else {
             throw AppStoreError.invalidResponse
         }
-        print("[purchase] HTTP \(httpResponse.statusCode)")
 
         guard let dict = parsePlistResponse(data) else {
+            print("[purchase] parse failed, raw: \(String(data: data, encoding: .utf8)?.prefix(500) ?? "")")
             throw AppStoreError.parseFailed
         }
 
@@ -702,13 +694,20 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
                 print("[purchase] license already exists")
                 return
             }
+            if failureType == "2034" {
+                // 2034 = password token 过期，需重新登录获取新 token
+                print("[purchase] failureType=2034, password token expired")
+                throw AppStoreError.notAuthenticated
+            }
             let msg = dict["customerMessage"] as? String ?? failureType
+            print("[purchase] failureType=\(failureType), msg=\(msg)")
             throw AppStoreError.purchaseFailed(message: msg)
         }
 
         let jingleDocType = dict["jingleDocType"] as? String
         let status = dict["status"] as? Int ?? -1
         guard jingleDocType == "purchaseSuccess", status == 0 else {
+            print("[purchase] unexpected: jingleDocType=\(jingleDocType ?? "nil"), status=\(status)")
             throw AppStoreError.purchaseFailed(message: "Unexpected response")
         }
 
@@ -728,12 +727,26 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
         let podPrefix = account.pod.isEmpty ? "" : "p\(account.pod)-"
         let volumeURL = URL(string: "https://\(podPrefix)\(privateAppStoreAPIDomain)\(privateAppStoreAPIPathDownload)?guid=\(identity.guid)")!
         var volumeDict = try await sendDownloadRequest(url: volumeURL, appID: appID, guid: identity.guid, externalVersionID: externalVersionID, versionKey: "externalVersionId")
+        // 首次响应：9610 (License not found) 需走购买流程获取授权，不立即失败；其他错误快速失败
+        if let ft = volumeDict["failureType"] as? String, !ft.isEmpty, ft != "9610" {
+            let msg = volumeDict["customerMessage"] as? String ?? ft
+            print("[download] failureType=\(ft), msg=\(msg)")
+            throw AppStoreError.downloadFailed(message: msg)
+        }
 
         // 2. 如果 songList 为空，尝试先购买再重试
         if isEmptyDownloadResponse(volumeDict) {
-            print("[download] volumeStore empty, attempting purchase...")
-            try? await purchase(appID: appID)
+            print("[download] volumeStore empty (keys: \(volumeDict.keys.sorted())), attempting purchase...")
+            do {
+                try await purchase(appID: appID)
+            } catch AppStoreError.notAuthenticated {
+                // token 过期，向上传播让上层刷新 token 后整体重试
+                throw AppStoreError.notAuthenticated
+            } catch {
+                print("[download] purchase failed: \(error.localizedDescription)")
+            }
             volumeDict = try await sendDownloadRequest(url: volumeURL, appID: appID, guid: identity.guid, externalVersionID: externalVersionID, versionKey: "externalVersionId")
+            try throwIfDownloadFailed(volumeDict)
         }
 
         // 3. 如果仍然为空，回退到 redownload 端点
@@ -742,6 +755,7 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
             if let redownloadURL = try? await redownloadEndpoint() {
                 do {
                     volumeDict = try await sendDownloadRequest(url: redownloadURL, appID: appID, guid: identity.guid, externalVersionID: externalVersionID, versionKey: "appExtVrsId")
+                    try throwIfDownloadFailed(volumeDict)
                 } catch {
                     print("[download] redownload failed: \(error)")
                 }
@@ -754,19 +768,27 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
             if let updateURL = try? await updateProductEndpoint() {
                 do {
                     volumeDict = try await sendDownloadRequest(url: updateURL, appID: appID, guid: identity.guid, externalVersionID: externalVersionID, versionKey: "appExtVrsId")
+                    try throwIfDownloadFailed(volumeDict)
                 } catch {
                     print("[download] updateProduct failed: \(error)")
                 }
             }
         }
 
-        if let failureType = volumeDict["failureType"] as? String, !failureType.isEmpty {
-            let msg = volumeDict["customerMessage"] as? String ?? failureType
-            print("[download] failureType=\(failureType), msg=\(msg)")
-            throw AppStoreError.downloadFailed(message: msg)
+        if isEmptyDownloadResponse(volumeDict) {
+            print("[download] all endpoints returned empty response (keys: \(volumeDict.keys.sorted()))")
         }
 
         return volumeDict
+    }
+
+    /// 若下载响应携带 failureType，立即抛出错误，避免继续尝试其他端点浪费请求。
+    private func throwIfDownloadFailed(_ dict: [String: Any]) throws {
+        if let failureType = dict["failureType"] as? String, !failureType.isEmpty {
+            let msg = dict["customerMessage"] as? String ?? failureType
+            print("[download] failureType=\(failureType), msg=\(msg)")
+            throw AppStoreError.downloadFailed(message: msg)
+        }
     }
 
     private func sendDownloadRequest(url: URL, appID: Int, guid: String, externalVersionID: String?, versionKey: String) async throws -> [String: Any] {
@@ -791,22 +813,14 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
         }
         request.httpBody = bodyData
 
-        print("[download] POST \(url.absoluteString)")
-
         let (data, response) = try await session.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
             throw AppStoreError.invalidResponse
         }
-        print("[download] HTTP \(httpResponse.statusCode)")
 
         guard let dict = parsePlistResponse(data) else {
-            print("[download] parsePlistResponse failed, raw: \(String(data: data, encoding: .utf8)?.prefix(500) ?? "")")
+            print("[download] parse failed: HTTP \(httpResponse.statusCode), \(data.count) bytes, raw: \(String(data: data, encoding: .utf8)?.prefix(500) ?? "<nil>")")
             throw AppStoreError.parseFailed
-        }
-
-        print("[download] response keys: \(dict.keys.sorted())")
-        if let songList = dict["songList"] {
-            print("[download] songList type: \(type(of: songList)), count: \( (songList as? [Any])?.count ?? -1 )")
         }
 
         return dict
@@ -879,8 +893,6 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
         let versionIDs = identifiers.map { "\($0)" }
         let latestID = metadata["softwareVersionExternalIdentifier"].map { "\($0)" }
 
-        print("[versions] total \(versionIDs.count) versions, latestID=\(latestID ?? "nil")")
-
         // Apple 返回的数组按时间升序（最早→最新）
         // 我们要：最新 → 次新 → ... → 最早
         // 先反转整个数组（最新→最早），然后确保最新版本在第一位
@@ -918,6 +930,72 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
 
     // MARK: - File Download
 
+    /// 从下载响应中提取 sinfs（FairPlay 解密密钥）
+    public struct Sinf {
+        public let id: Int64
+        public let data: Data
+
+        public init(id: Int64, data: Data) {
+            self.id = id
+            self.data = data
+        }
+    }
+
+    /// 从下载响应中提取 sinfs 列表
+    public func extractSinfs(from dict: [String: Any]) -> [Sinf] {
+        guard let songList = dict["songList"] as? [Any],
+              let item = songList.first as? [String: Any],
+              let sinfs = item["sinfs"] as? [[String: Any]] else {
+            return []
+        }
+        return sinfs.compactMap { sinf in
+            guard let data = sinf["sinf"] as? Data else { return nil }
+            let id = (sinf["id"] as? Int64) ?? Int64(sinf["id"] as? Int ?? 0)
+            return Sinf(id: id, data: data)
+        }
+    }
+
+    /// 从下载响应中提取 metadata
+    public func extractMetadata(from dict: [String: Any]) -> [String: Any]? {
+        guard let songList = dict["songList"] as? [Any],
+              let item = songList.first as? [String: Any] else {
+            return nil
+        }
+        return item["metadata"] as? [String: Any]
+    }
+
+    /// 从下载响应中提取 asset-info
+    public func extractAssetInfo(from dict: [String: Any]) -> [String: Any]? {
+        guard let songList = dict["songList"] as? [Any],
+              let item = songList.first as? [String: Any] else {
+            return nil
+        }
+        return item["asset-info"] as? [String: Any]
+    }
+
+    /// Sinf 注入所需的信息（FairPlay 解密密钥 + 元数据 + 账号）
+    public struct SinfPatchInfo {
+        public let sinfs: [Sinf]
+        public let metadata: [String: Any]?
+        public let account: AccountInfo
+
+        public init(sinfs: [Sinf], metadata: [String: Any]?, account: AccountInfo) {
+            self.sinfs = sinfs
+            self.metadata = metadata
+            self.account = account
+        }
+    }
+
+    /// 从下载响应中提取 sinf 注入所需信息。
+    /// 调用方负责实际的 zip 写入（如使用 ZIPFoundation 或系统 zip 命令）。
+    public func extractSinfPatchInfo(from dict: [String: Any]) -> SinfPatchInfo? {
+        guard let account = account else { return nil }
+        let sinfs = extractSinfs(from: dict)
+        guard !sinfs.isEmpty else { return nil }
+        let metadata = extractMetadata(from: dict)
+        return SinfPatchInfo(sinfs: sinfs, metadata: metadata, account: account)
+    }
+
     /// 从下载响应中提取下载 URL
     public func extractDownloadURL(from dict: [String: Any]) -> URL? {
         guard let songList = dict["songList"] as? [Any],
@@ -931,16 +1009,12 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
 
     /// 下载文件到指定路径，支持进度回调
     public func downloadFile(from url: URL, to destination: URL, progress: @escaping (Double) -> Void) async throws {
-        print("[download-file] GET \(url.absoluteString)")
-        print("[download-file] destination: \(destination.path)")
-
         let (asyncBytes, response) = try await session.bytes(from: url)
         guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
             throw AppStoreError.downloadFailed(message: "下载失败：HTTP \((response as? HTTPURLResponse)?.statusCode ?? -1)")
         }
 
         let totalBytes = httpResponse.expectedContentLength
-        print("[download-file] HTTP 200, totalBytes=\(totalBytes)")
 
         // 确保目标目录存在
         let dir = destination.deletingLastPathComponent()
@@ -980,8 +1054,6 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
         if totalBytes > 0 {
             progress(1.0)
         }
-
-        print("[download-file] download complete, \(received) bytes")
     }
 
     // MARK: - macOS 包解密
@@ -1201,7 +1273,7 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
         guard let httpResponse = response as? HTTPURLResponse else {
             throw AppStoreError.invalidResponse
         }
-        print("[owned-apps] \(url.lastPathComponent) HTTP \(httpResponse.statusCode), \(data.count) bytes")
+
 
         guard httpResponse.statusCode == 200 else {
             throw AppStoreError.downloadFailed(message: "DAAP request failed with HTTP \(httpResponse.statusCode)")
