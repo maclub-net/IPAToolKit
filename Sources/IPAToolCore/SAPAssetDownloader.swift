@@ -377,48 +377,40 @@ public enum SAPAssetDownloader {
     }
 
     private static func extractCPIOEntries(_ data: Data, wantedPaths: Set<String>) -> [String: Data] {
+        // Apple 更新包使用旧版 odc 格式（magic "070707"）：
+        // 76 字节定长头，namesize/filesize 为八进制 ASCII（偏移 59/65），
+        // 文件名以 NUL 结尾，条目无对齐填充（对齐 ipadecrypt 的 cpio.Reader）
         var result: [String: Data] = [:]
         var pos = 0
-        let magic = "070701" // newc format
 
-        while pos + 110 <= data.count {
-            let headerData = data.subdata(in: pos..<(pos + 110))
-            guard let headerStr = String(data: headerData, encoding: .ascii) else { break }
-            guard headerStr.hasPrefix(magic) else { break }
+        while pos + 76 <= data.count {
+            let header = data.subdata(in: pos..<(pos + 76))
+            guard let magic = String(data: header.subdata(in: 0..<6), encoding: .ascii),
+                  magic == "070707" else { break }
 
-            // newc format: 6 字符 magic + 13 字段各 8 字符十六进制
-            func field(_ idx: Int) -> Int? {
-                let start = 6 + idx * 8
-                guard start + 8 <= headerStr.count else { return nil }
-                let s = headerStr.index(headerStr.startIndex, offsetBy: start)
-                let e = headerStr.index(s, offsetBy: 8)
-                return Int(headerStr[s..<e], radix: 16)
+            func octal(_ range: Range<Int>) -> Int? {
+                guard let s = String(data: header.subdata(in: range), encoding: .ascii) else { return nil }
+                return Int(s, radix: 8)
             }
+            guard let namesize = octal(59..<65), namesize > 0,
+                  let filesize = octal(65..<76) else { break }
 
-            guard let namesize = field(9), let filesize = field(6) else { break }
-
-            let nameStart = pos + 110
+            let nameStart = pos + 76
             guard nameStart + namesize <= data.count else { break }
-            let nameData = data.subdata(in: nameStart..<(nameStart + namesize))
-            let name = String(data: nameData, encoding: .ascii)?.trimmingCharacters(in: .controlCharacters) ?? ""
+            let nameBytes = data.subdata(in: nameStart..<(nameStart + namesize))
+            let name = String(data: nameBytes.dropLast(), encoding: .ascii) ?? ""
+            if name == "TRAILER!!!" { break }
 
-            // 计算 data 起始位置（4 字节对齐）
-            let headerAndName = 110 + namesize
-            let dataStart = pos + ((headerAndName + 3) & ~3)
+            let dataStart = nameStart + namesize
             let dataEnd = dataStart + filesize
 
-            if wantedPaths.contains(name) {
-                if dataEnd <= data.count {
-                    result[name] = data.subdata(in: dataStart..<dataEnd)
-                }
-                if result.count == wantedPaths.count {
-                    break
-                }
+            if wantedPaths.contains(name), dataEnd <= data.count {
+                result[name] = data.subdata(in: dataStart..<dataEnd)
+                print("[sap-assets] found \(name) (\(filesize) bytes)")
+                if result.count == wantedPaths.count { break }
             }
 
-            // 移动到下一个条目（data 也 4 字节对齐）
-            let entrySize = ((filesize + 3) & ~3)
-            pos = dataStart + entrySize
+            pos = dataEnd
         }
 
         return result
