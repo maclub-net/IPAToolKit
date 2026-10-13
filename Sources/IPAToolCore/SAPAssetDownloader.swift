@@ -276,29 +276,40 @@ public enum SAPAssetDownloader {
     private static func downloadSAPAssets() async throws -> [String: Data] {
         // 1. 下载 XAR header (28 bytes)
         let headerData = try await downloadRange(from: 0, length: 28)
-        guard headerData.count >= 28 else { throw SAPDownloadError.networkFailed }
+        guard headerData.count >= 28 else {
+            print("[sap-assets] header too short: \(headerData.count)")
+            throw SAPDownloadError.networkFailed
+        }
 
         let magic = headerData.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 0, as: UInt32.self) }
         guard magic == 0x21726178 else { // "xar!" little-endian
+            print("[sap-assets] bad XAR magic: \(String(format: "0x%08x", magic))")
             throw SAPDownloadError.extractionFailed
         }
 
         let tocCompressedSize = headerData.withUnsafeBytes { Int($0.loadUnaligned(fromByteOffset: 4, as: UInt64.self).bigEndian) }
         let tocUncompressedSize = headerData.withUnsafeBytes { Int($0.loadUnaligned(fromByteOffset: 12, as: UInt64.self).bigEndian) }
+        print("[sap-assets] XAR header ok, TOC compressed=\(tocCompressedSize) uncompressed=\(tocUncompressedSize)")
 
         // 2. 下载压缩的 TOC
         let tocCompressed = try await downloadRange(from: 28, length: tocCompressedSize)
-        guard tocCompressed.count == tocCompressedSize else { throw SAPDownloadError.networkFailed }
+        guard tocCompressed.count == tocCompressedSize else {
+            print("[sap-assets] TOC size mismatch: \(tocCompressed.count) != \(tocCompressedSize)")
+            throw SAPDownloadError.networkFailed
+        }
 
         // 3. 解压 TOC (zlib)
         guard let tocData = decompressZlib(tocCompressed, uncompressedSize: tocUncompressedSize) else {
+            print("[sap-assets] TOC zlib decompress failed")
             throw SAPDownloadError.extractionFailed
         }
 
         // 4. 解析 TOC XML，查找 Payload 的 offset 和 size
         guard let payload = parseXARToc(tocData) else {
+            print("[sap-assets] XAR TOC parse failed, no Payload entry")
             throw SAPDownloadError.extractionFailed
         }
+        print("[sap-assets] Payload offset=\(payload.offset) size=\(payload.size)")
 
         let heapOffset = 28 + tocCompressedSize
         let payloadHeapOffset = heapOffset + payload.offset
@@ -308,6 +319,7 @@ public enum SAPAssetDownloader {
         // 4 个文件总共约 38MB，bzip2 压缩后约 10-15MB，下载 50MB 足够
         let downloadSize = min(50 * 1024 * 1024, payload.size - Int(payloadBZOffset))
         let bz2Data = try await downloadRange(from: bz2Start, length: downloadSize)
+        print("[sap-assets] bz2 chunk downloaded: \(bz2Data.count) bytes, decompressing...")
 
         // Go 代码在数据前补 "BZh9"
         var bz2Full = Data([0x42, 0x5A, 0x68, 0x39]) // "BZh9"
@@ -320,6 +332,7 @@ public enum SAPAssetDownloader {
             csap_bz2_decompress(ptr.bindMemory(to: UInt8.self).baseAddress, bz2Full.count, &outputPtr, &outputLen)
         }
         guard ret == 0, let ptr = outputPtr, outputLen > 0 else {
+            print("[sap-assets] bz2 decompress failed: ret=\(ret) outputLen=\(outputLen)")
             throw SAPDownloadError.extractionFailed
         }
         let cpioData = Data(bytesNoCopy: ptr, count: outputLen, deallocator: .free)
@@ -327,6 +340,7 @@ public enum SAPAssetDownloader {
 
         // 7. 解析 CPIO，提取 4 个文件
         let files = extractCPIOEntries(cpioData, wantedPaths: Set(requiredSAPFiles.map { $0.path }))
+        print("[sap-assets] extracted \(files.count)/\(requiredSAPFiles.count) files")
         return files
     }
 
@@ -396,9 +410,18 @@ public enum SAPAssetDownloader {
     private static func downloadRange(from offset: Int, length: Int) async throws -> Data {
         var request = URLRequest(url: applePackageURL)
         request.setValue("bytes=\(offset)-\(offset + length - 1)", forHTTPHeaderField: "Range")
+        request.timeoutInterval = 120
+        print("[sap-assets] range request offset=\(offset) length=\(length)")
         let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse,
-              http.statusCode == 206 || http.statusCode == 200 else {
+        guard let http = response as? HTTPURLResponse else {
+            print("[sap-assets] range request failed: non-HTTP response")
+            throw SAPDownloadError.networkFailed
+        }
+        print("[sap-assets] range response status=\(http.statusCode) bytes=\(data.count)")
+        // 必须严格返回 206：若服务器忽略 Range 返回 200，拿到的是整包数据，
+        // 直接作为分片使用会导致解压出错误内容
+        guard http.statusCode == 206 else {
+            print("[sap-assets] range request rejected: expected 206, got \(http.statusCode)")
             throw SAPDownloadError.networkFailed
         }
         return data
