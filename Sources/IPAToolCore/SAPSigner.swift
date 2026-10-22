@@ -347,6 +347,65 @@ public class SAPSigner {
     }
 }
 
+// MARK: - kbsync
+
+/// 生成 ent/download 所需的 kbsync 数据（账号与硬件绑定的 FairPlay blob）。
+/// 对齐 ipatool-go 的 `machine.GenerateKBSync`：只打开 StoreAgent 上下文，不建立解密会话。
+public enum StoreAgentKBSync {
+    /// 生成 kbsync，返回原始字节（调用方自行 base64 后放入请求）
+    public static func generate(assets: SAPAssets, hardwareID: Data, directoryServicesID: UInt64) throws -> Data {
+        guard directoryServicesID != 0 else {
+            throw SAPError.kbsyncGenerationFailed
+        }
+
+        let coreFP = try assets.load(.coreFP)
+        let commerceCore = try assets.load(.commerceCore)
+        let commerceKit = try assets.load(.commerceKit)
+        let icxs = try? assets.load(.coreFPICXS)
+        let storeagent = try assets.load(.storeagent)
+
+        var coreFPBytes = [UInt8](coreFP)
+        var ccBytes = [UInt8](commerceCore)
+        var ckBytes = [UInt8](commerceKit)
+        var icxsBytes = icxs != nil ? [UInt8](icxs!) : []
+        var saBytes = [UInt8](storeagent)
+        var hwBytes = [UInt8](hardwareID)
+
+        var outPtr: UnsafeMutablePointer<UInt8>?
+        var outLen: Int = 0
+
+        let ret = coreFPBytes.withUnsafeMutableBufferPointer { coreFPBuf in
+            ccBytes.withUnsafeMutableBufferPointer { ccBuf in
+                ckBytes.withUnsafeMutableBufferPointer { ckBuf in
+                    icxsBytes.withUnsafeMutableBufferPointer { icxsBuf in
+                        saBytes.withUnsafeMutableBufferPointer { saBuf in
+                            hwBytes.withUnsafeMutableBufferPointer { hwBuf in
+                                csap_storeagent_generate_kbsync(
+                                    coreFPBuf.baseAddress, coreFPBuf.count,
+                                    ccBuf.baseAddress, ccBuf.count,
+                                    ckBuf.baseAddress, ckBuf.count,
+                                    icxs != nil ? icxsBuf.baseAddress : nil, icxsBuf.count,
+                                    saBuf.baseAddress, saBuf.count,
+                                    hwBuf.baseAddress, hwBuf.count,
+                                    directoryServicesID,
+                                    &outPtr, &outLen
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        guard ret == 0, let ptr = outPtr, outLen > 0 else {
+            throw SAPError.kbsyncGenerationFailed
+        }
+        defer { free(ptr) }
+
+        return Data(bytes: ptr, count: outLen)
+    }
+}
+
 // MARK: - Errors
 
 public enum SAPError: Error {
@@ -362,6 +421,7 @@ public enum SAPError: Error {
     case storeAgentOpenFailed
     case storeAgentNotOpen
     case storeAgentDecryptFailed(status: Int32)
+    case kbsyncGenerationFailed
 }
 
 // MARK: - Assets

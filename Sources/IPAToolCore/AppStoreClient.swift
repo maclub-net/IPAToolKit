@@ -38,6 +38,11 @@ public enum Platform: String, CaseIterable, Codable {
         }
     }
 
+    /// 是否属于 iOS 系（iPhone / iPad），用于下载时优先选择 IPA
+    public var isIOS: Bool {
+        self == .iphone || self == .ipad
+    }
+
     public var displayName: String {
         switch self {
         case .iphone: return "iPhone"
@@ -264,6 +269,10 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
     }()
 
     public var account: AccountInfo?
+
+    /// ent/download 用的 kbsync 缓存，仅在 ent/download 返回有效响应后写入。
+    /// 被拒绝时失效并重新生成一次（对齐 ipatool-go）。
+    private var kbsyncCache: (directoryServicesID: UInt64, guid: String, blob: String)?
 
     public override init() {
         let config = URLSessionConfiguration.default
@@ -716,17 +725,36 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
 
     // MARK: - Download (product request)
 
-    public func downloadProduct(appID: Int, externalVersionID: String? = nil) async throws -> [String: Any] {
+    public func downloadProduct(appID: Int, externalVersionID: String? = nil, preferPlatform: Platform? = nil) async throws -> [String: Any] {
         guard let account = account else {
             throw AppStoreError.notAuthenticated
         }
 
         let identity = try currentMachineIdentity()
 
+        // 同一应用同时提供 iOS 与 macOS 构建时优先取 IPA：
+        // 未显式指定版本时先解析该平台当前版本，Apple 会据此返回对应平台的包。
+        var resolvedVersionID = externalVersionID
+        if resolvedVersionID == nil, let preferPlatform, preferPlatform.isIOS {
+            resolvedVersionID = await latestExternalVersionID(appID: appID, platform: preferPlatform)
+            print("[download] prefer \(preferPlatform.rawValue), resolved externalVersionID=\(resolvedVersionID ?? "<nil>")")
+        }
+
+        // 0. 首选 ent/download（kbsync 授权链路，对齐 ipatool-go）：
+        // 失败（资产缺失、端点缺失、响应不匹配）时静默降级到下面的旧链路。
+        if let entDict = await entDownloadResponse(
+            appID: appID,
+            identity: identity,
+            externalVersionID: resolvedVersionID,
+            preferPlatform: preferPlatform
+        ) {
+            return entDict
+        }
+
         // 1. 尝试 volumeStoreDownloadProduct
         let podPrefix = account.pod.isEmpty ? "" : "p\(account.pod)-"
         let volumeURL = URL(string: "https://\(podPrefix)\(privateAppStoreAPIDomain)\(privateAppStoreAPIPathDownload)?guid=\(identity.guid)")!
-        var volumeDict = try await sendDownloadRequest(url: volumeURL, appID: appID, guid: identity.guid, externalVersionID: externalVersionID, versionKey: "externalVersionId")
+        var volumeDict = try await sendDownloadRequest(url: volumeURL, appID: appID, guid: identity.guid, externalVersionID: resolvedVersionID, versionKey: "externalVersionId")
         // 首次响应：9610 (License not found) 需走购买流程获取授权，不立即失败；其他错误快速失败
         if let ft = volumeDict["failureType"] as? String, !ft.isEmpty, ft != "9610" {
             let msg = volumeDict["customerMessage"] as? String ?? ft
@@ -745,7 +773,7 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
             } catch {
                 print("[download] purchase failed: \(error.localizedDescription)")
             }
-            volumeDict = try await sendDownloadRequest(url: volumeURL, appID: appID, guid: identity.guid, externalVersionID: externalVersionID, versionKey: "externalVersionId")
+            volumeDict = try await sendDownloadRequest(url: volumeURL, appID: appID, guid: identity.guid, externalVersionID: resolvedVersionID, versionKey: "externalVersionId")
             try throwIfDownloadFailed(volumeDict)
         }
 
@@ -754,7 +782,7 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
             print("[download] still empty, trying redownload...")
             if let redownloadURL = try? await redownloadEndpoint() {
                 do {
-                    volumeDict = try await sendDownloadRequest(url: redownloadURL, appID: appID, guid: identity.guid, externalVersionID: externalVersionID, versionKey: "appExtVrsId")
+                    volumeDict = try await sendDownloadRequest(url: redownloadURL, appID: appID, guid: identity.guid, externalVersionID: resolvedVersionID, versionKey: "appExtVrsId")
                     try throwIfDownloadFailed(volumeDict)
                 } catch {
                     print("[download] redownload failed: \(error)")
@@ -767,7 +795,7 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
             print("[download] still empty, trying updateProduct...")
             if let updateURL = try? await updateProductEndpoint() {
                 do {
-                    volumeDict = try await sendDownloadRequest(url: updateURL, appID: appID, guid: identity.guid, externalVersionID: externalVersionID, versionKey: "appExtVrsId")
+                    volumeDict = try await sendDownloadRequest(url: updateURL, appID: appID, guid: identity.guid, externalVersionID: resolvedVersionID, versionKey: "appExtVrsId")
                     try throwIfDownloadFailed(volumeDict)
                 } catch {
                     print("[download] updateProduct failed: \(error)")
@@ -777,6 +805,11 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
 
         if isEmptyDownloadResponse(volumeDict) {
             print("[download] all endpoints returned empty response (keys: \(volumeDict.keys.sorted()))")
+        }
+
+        // 响应里同时含 iOS 与 macOS 包时，把 IPA 排到首位（其余提取方法都取 songList.first）
+        if let preferPlatform, preferPlatform.isIOS {
+            volumeDict = Self.preferringIOSItem(in: volumeDict)
         }
 
         return volumeDict
@@ -853,17 +886,298 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
         return URL(string: "\(endpoint)?guid=\(identity.guid)")
     }
 
+    // MARK: - ent/download（kbsync 首选链路）
+
+    /// 通过 bag 中的 ent/download 端点请求下载，返回 nil 表示该链路不可用（调用方降级到旧链路）。
+    private func entDownloadResponse(
+        appID: Int,
+        identity: MachineIdentity,
+        externalVersionID: String?,
+        preferPlatform: Platform?
+    ) async -> [String: Any]? {
+        guard let account, let dsid = UInt64(account.directoryServicesID), dsid != 0 else {
+            print("[ent] skipped: invalid DSID")
+            return nil
+        }
+
+        // 未钉版本时先解析平台当前版本，Apple 据此返回对应平台的构建
+        var versionID = externalVersionID
+        if versionID == nil {
+            versionID = await latestExternalVersionID(appID: appID, platform: preferPlatform ?? .iphone)
+        }
+        guard let versionID, !versionID.isEmpty else {
+            print("[ent] skipped: unresolved external version id")
+            return nil
+        }
+
+        guard let endpoint = await entDownloadEndpoint(guid: identity.guid) else {
+            return nil
+        }
+
+        if let cached = kbsyncCache,
+           cached.directoryServicesID == dsid, cached.guid == identity.guid,
+           let dict = await sendEntDownloadRequest(
+               endpoint: endpoint,
+               appID: appID,
+               identity: identity,
+               versionID: versionID,
+               kbsync: cached.blob
+           ) {
+            print("[ent] downloaded with cached kbsync")
+            return dict
+        }
+        // 缓存被拒绝（或不存在）：失效后重新生成一次
+        kbsyncCache = nil
+
+        guard let blob = generateKBSync(identity: identity, directoryServicesID: dsid) else {
+            return nil
+        }
+
+        guard let dict = await sendEntDownloadRequest(
+            endpoint: endpoint,
+            appID: appID,
+            identity: identity,
+            versionID: versionID,
+            kbsync: blob
+        ) else {
+            return nil
+        }
+
+        kbsyncCache = (dsid, identity.guid, blob)
+        print("[ent] downloaded with fresh kbsync")
+        return dict
+    }
+
+    private func entDownloadEndpoint(guid: String) async -> URL? {
+        guard let urlBag = try? await fetchURLBag() else { return nil }
+        guard let endpoint = urlBag["volumeStoreDownloadProduct"] as? String, !endpoint.isEmpty else {
+            print("[ent] no ent/download endpoint in bag")
+            return nil
+        }
+        guard let url = URL(string: "\(endpoint)?guid=\(guid)"),
+              url.host == "downloaddispatch.\(iTunesAPIDomain)",
+              url.path == "/WebObjects/DownloadDispatch.woa/wa/ent/download" else {
+            print("[ent] unexpected ent/download endpoint: \(endpoint)")
+            return nil
+        }
+        return url
+    }
+
+    private func generateKBSync(identity: MachineIdentity, directoryServicesID: UInt64) -> String? {
+        let assets = SAPAssets(directory: SAPAssets.defaultCacheDirectory)
+        do {
+            let data = try StoreAgentKBSync.generate(
+                assets: assets,
+                hardwareID: identity.hardwareID,
+                directoryServicesID: directoryServicesID
+            )
+            return data.base64EncodedString()
+        } catch {
+            print("[ent] kbsync generation failed: \(error)")
+            return nil
+        }
+    }
+
+    private func sendEntDownloadRequest(
+        endpoint: URL,
+        appID: Int,
+        identity: MachineIdentity,
+        versionID: String,
+        kbsync: String
+    ) async -> [String: Any]? {
+        guard let account else { return nil }
+
+        // serialNumber 由 5 字节固定前缀 + 硬件 ID 后 4 字节组成
+        var serialBytes: [UInt8] = [0x54, 0xc8, 0xb0, 0xa9, 0x88]
+        serialBytes.append(contentsOf: identity.hardwareID.dropFirst(2))
+
+        let body: [String: Any] = [
+            "creditDisplay": "",
+            "guid": identity.guid,
+            "kbsync": kbsync,
+            "salableAdamId": String(appID),
+            "serialNumber": Data(serialBytes).base64EncodedString(),
+            "externalVersionId": versionID,
+        ]
+
+        guard let bodyData = try? PropertyListSerialization.data(fromPropertyList: body, format: .xml, options: 0) else {
+            return nil
+        }
+
+        // X-Token 不允许跟随重定向，与 ipatool-go 一致使用不重定向的 session
+        var request = defaultRequest(endpoint, method: "POST")
+        request.setValue("application/x-www-form-urlencoded; charset=utf-8", forHTTPHeaderField: "Content-Type")
+        request.setValue("Configurator/2.18 (Macintosh; OS X 15.3.2; 24D81) AppleWebKit/0620.2.4.11.6", forHTTPHeaderField: "User-Agent")
+        request.setValue(account.storeFront, forHTTPHeaderField: "X-Apple-Store-Front")
+        request.setValue(account.passwordToken, forHTTPHeaderField: "X-Token")
+        request.setValue(account.directoryServicesID, forHTTPHeaderField: "iCloud-DSID")
+        request.setValue(account.directoryServicesID, forHTTPHeaderField: "X-Dsid")
+        request.httpBody = bodyData
+
+        guard let (data, response) = try? await noRedirectSession.data(for: request),
+              let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200,
+              let dict = parsePlistResponse(data) else {
+            print("[ent] request failed or response unparsable")
+            return nil
+        }
+
+        if let failureType = dict["failureType"] as? String, !failureType.isEmpty {
+            print("[ent] failureType=\(failureType), msg=\(dict["customerMessage"] as? String ?? "-")")
+            return nil
+        }
+        if let message = dict["customerMessage"] as? String, !message.isEmpty {
+            print("[ent] customerMessage=\(message)")
+            return nil
+        }
+
+        // 响应必须唯一，且与请求的应用/版本/bundle 匹配，避免误用其他构建
+        guard let songList = dict["songList"] as? [Any], songList.count == 1,
+              let item = songList.first as? [String: Any],
+              let metadata = item["metadata"] as? [String: Any],
+              let itemID = stringValue(metadata["itemId"]), itemID == String(appID),
+              let returnedVersion = stringValue(metadata["softwareVersionExternalIdentifier"]),
+              returnedVersion == versionID,
+              let urlString = item["URL"] as? String, !urlString.isEmpty else {
+            print("[ent] response does not match the requested app or version")
+            return nil
+        }
+
+        return dict
+    }
+
+    /// 同一响应里同时含 iOS 与 macOS 包时，把 IPA 放到 songList 首位。
+    private static func preferringIOSItem(in dict: [String: Any]) -> [String: Any] {
+        guard let songList = dict["songList"] as? [Any], songList.count > 1 else {
+            return dict
+        }
+
+        let items = songList.compactMap { $0 as? [String: Any] }
+        guard items.count == songList.count else {
+            return dict
+        }
+
+        var result = dict
+        result["songList"] = items.filter { !isMacPackageItem($0) } + items.filter { isMacPackageItem($0) }
+        return result
+    }
+
+    /// macOS 包在 sinfs 中带 dpInfo；IPA 没有
+    private static func isMacPackageItem(_ item: [String: Any]) -> Bool {
+        guard let sinfs = item["sinfs"] as? [[String: Any]] else {
+            return false
+        }
+        return sinfs.contains { sinf in
+            guard let dpInfo = sinf["dpInfo"] as? Data else {
+                return false
+            }
+            return !dpInfo.isEmpty
+        }
+    }
+
+    /// 解析指定平台当前版本的外部版本号（对齐 ipatool-go 的 platform version lookup）。
+    /// 先走 MDM 目录接口，失败再走公开的 App Store catalog 接口。
+    private func latestExternalVersionID(appID: Int, platform: Platform) async -> String? {
+        let country = account.map { countryCode(from: $0.storeFront) } ?? "US"
+
+        if let identifier = await mdmLatestExternalVersionID(appID: appID, country: country) {
+            return identifier
+        }
+
+        return await catalogLatestExternalVersionID(appID: appID, country: country, platform: platform)
+    }
+
+    private func mdmLatestExternalVersionID(appID: Int, country: String) async -> String? {
+        var components = URLComponents(string: "https://uclient-api.itunes.apple.com/WebObjects/MZStorePlatform.woa/wa/lookup")!
+        components.queryItems = [
+            URLQueryItem(name: "version", value: "2"),
+            URLQueryItem(name: "id", value: String(appID)),
+            URLQueryItem(name: "p", value: "mdm-lockup"),
+            URLQueryItem(name: "caller", value: "MDM"),
+            URLQueryItem(name: "platform", value: "enterprisestore"),
+            URLQueryItem(name: "cc", value: country.lowercased()),
+            URLQueryItem(name: "l", value: "en"),
+        ]
+
+        guard let url = components.url,
+              let json = await getJSON(url),
+              let results = json["results"] as? [String: Any],
+              let item = results[String(appID)] as? [String: Any],
+              let offers = item["offers"] as? [[String: Any]],
+              let offer = offers.first else {
+            return nil
+        }
+
+        if let version = offer["version"] as? [String: Any],
+           let external = version["externalId"],
+           let identifier = stringValue(external), !identifier.isEmpty {
+            return identifier
+        }
+
+        if let buyParams = offer["buyParams"] as? String {
+            return externalVersionIDFromBuyParams(buyParams)
+        }
+
+        return nil
+    }
+
+    private func catalogLatestExternalVersionID(appID: Int, country: String, platform: Platform) async -> String? {
+        let catalogPlatform = platform == .ipad ? "ipad" : "iphone"
+        guard let url = URL(string: "https://apps.apple.com/api/apps/v1/catalog/\(country.lowercased())/apps/\(appID)?platform=\(catalogPlatform)"),
+              let json = await getJSON(url),
+              let data = json["data"] as? [[String: Any]],
+              let first = data.first,
+              let attributes = first["attributes"] as? [String: Any],
+              let platformAttributes = attributes["platformAttributes"] as? [String: Any],
+              let ios = platformAttributes["ios"] as? [String: Any],
+              let external = ios["externalVersionId"],
+              let identifier = stringValue(external), !identifier.isEmpty else {
+            return nil
+        }
+
+        return identifier
+    }
+
+    private func getJSON(_ url: URL) async -> [String: Any]? {
+        guard let (data, response) = try? await session.data(for: defaultRequest(url)),
+              let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return json
+    }
+
+    private func stringValue(_ value: Any?) -> String? {
+        if let string = value as? String {
+            return string
+        }
+        if let number = value as? NSNumber {
+            return number.stringValue
+        }
+        return nil
+    }
+
+    private func externalVersionIDFromBuyParams(_ buyParams: String) -> String? {
+        guard let components = URLComponents(string: "?" + buyParams),
+              let value = components.queryItems?.first(where: { $0.name == "appExtVrsId" })?.value,
+              !value.isEmpty else {
+            return nil
+        }
+        return value
+    }
+
     // MARK: - List Versions
 
-    public func listVersions(appID: Int) async throws -> [String] {
+    public func listVersions(appID: Int, preferPlatform: Platform? = nil) async throws -> [String] {
         // 先尝试获取版本列表，如果没有 license 则先购买再重试
         do {
-            let dict = try await downloadProduct(appID: appID)
+            let dict = try await downloadProduct(appID: appID, preferPlatform: preferPlatform)
             return try extractVersions(from: dict)
         } catch AppStoreError.downloadFailed(let msg) where msg.contains("License") || msg.contains("license") {
             print("[versions] no license, purchasing first...")
             try await purchase(appID: appID)
-            let dict = try await downloadProduct(appID: appID)
+            let dict = try await downloadProduct(appID: appID, preferPlatform: preferPlatform)
             return try extractVersions(from: dict)
         }
     }
