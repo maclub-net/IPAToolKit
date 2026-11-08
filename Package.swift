@@ -29,7 +29,15 @@ let package = Package(
         .target(
             name: "IPAToolCore",
             dependencies: ["CSAP"],
-            path: "Sources/IPAToolCore"
+            path: "Sources/IPAToolCore",
+            resources: [
+                .copy("Resources")
+            ]
+        ),
+        .testTarget(
+            name: "IPAToolCoreTests",
+            dependencies: ["IPAToolCore"],
+            path: "Tests/IPAToolCoreTests"
         ),
     ]
 )

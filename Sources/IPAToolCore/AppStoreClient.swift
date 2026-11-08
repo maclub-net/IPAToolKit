@@ -11,8 +11,18 @@ private let iTunesAPIPathLookup = "/lookup"
 private let privateAppStoreAPIDomain = "buy.itunes.apple.com"
 private let privateAppStoreAPIPathPurchase = "/WebObjects/MZFinance.woa/wa/buyProduct"
 private let privateAppStoreAPIPathDownload = "/WebObjects/MZFinance.woa/wa/volumeStoreDownloadProduct"
+private let downloadDispatchDomain = "downloaddispatch.\(iTunesAPIDomain)"
+private let entDownloadPath = "/WebObjects/DownloadDispatch.woa/wa/ent/download"
+private let redownloadProductPath = "/r/redownload"
+private let updateProductPath = "/up/updateProduct"
 private let privatePurchaseDAAPBaseURL = "https://pd.itunes.apple.com/WebObjects/MZPurchaseDaap.woa/purchase"
+// Apple 只对 Configurator 2.21 及以上的 macOS 客户端下发原生鉴权端点
+// （auth.itunes.apple.com），其余平台继续沿用旧端点。
+#if os(macOS)
+private let defaultUserAgent = "Configurator/2.21 (Macintosh; OS X 15.2; 24C5089c) AppleWebKit/0620.1.16.11.6"
+#else
 private let defaultUserAgent = "Configurator/2.17 (Macintosh; OS X 15.2; 24C5089c) AppleWebKit/0620.1.16.11.6"
+#endif
 
 private let pricingParameterAppStore = "STDQ"
 private let pricingParameterAppleArcade = "GAME"
@@ -274,6 +284,11 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
     /// 被拒绝时失效并重新生成一次（对齐 ipatool-go）。
     private var kbsyncCache: (directoryServicesID: UInt64, guid: String, blob: String)?
 
+    /// 持久化的 Anisette 状态，以及本次鉴权请求要携带的 AuthKit 头。
+    private var anisetteState: Data?
+    private var authenticationHeaders: [String: String] = [:]
+    private let anisetteStore = AnisetteStateStore()
+
     public override init() {
         let config = URLSessionConfiguration.default
         config.httpShouldSetCookies = true
@@ -316,6 +331,137 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
         return dict
     }
 
+    /// 把 AuthKit 头注入鉴权请求：`X-Apple-I-MD*` 在 Store 端叫 `X-Apple-AMD*`。
+    private func applyAuthenticationHeaders(to request: inout URLRequest) {
+        guard !authenticationHeaders.isEmpty else {
+            return
+        }
+
+        for (key, value) in authenticationHeaders
+            where !["X-APPLE-I-MD", "X-APPLE-I-MD-M"].contains(key.uppercased()) {
+            request.setValue(value, forHTTPHeaderField: key)
+        }
+
+        if let otp = authenticationHeader(named: "X-Apple-I-MD") {
+            request.setValue(otp, forHTTPHeaderField: "X-Apple-AMD")
+        }
+        if let proof = authenticationHeader(named: "X-Apple-I-MD-M") {
+            request.setValue(proof, forHTTPHeaderField: "X-Apple-AMD-M")
+        }
+    }
+
+    private func removeAuthenticationHeaders(_ names: [String]) {
+        let keys = authenticationHeaders.keys.filter { key in
+            names.contains { $0.caseInsensitiveCompare(key) == .orderedSame }
+        }
+
+        for key in keys {
+            authenticationHeaders.removeValue(forKey: key)
+        }
+    }
+
+    private func authenticationHeader(named name: String) -> String? {
+        authenticationHeaders.first { $0.key.caseInsensitiveCompare(name) == .orderedSame }?.value
+    }
+
+    /// `guid` 是硬件地址的大写十六进制，Store 需要它对应的原始 6 字节。
+    private func hardwareID(forGUID guid: String) throws -> Data {
+        guard guid.count == 12 else {
+            throw AppStoreError.loginFailed(message: "设备 GUID 格式不正确")
+        }
+
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(6)
+        var index = guid.startIndex
+        for _ in 0 ..< 6 {
+            let next = guid.index(index, offsetBy: 2)
+            guard let byte = UInt8(guid[index ..< next], radix: 16) else {
+                throw AppStoreError.loginFailed(message: "设备 GUID 格式不正确")
+            }
+            bytes.append(byte)
+            index = next
+        }
+
+        return Data(bytes)
+    }
+
+    private func persistAnisetteState(_ state: Data) throws {
+        try anisetteStore.save(state)
+        anisetteState = state
+    }
+
+    /// Store 预置之后，Apple 要求每个商务请求都携带设备证明。
+    private func attachStoreAMDProof(to request: inout URLRequest, endpoint: URL) throws {
+        guard isStoreAMDCommerceURL(endpoint) else {
+            return
+        }
+
+        if anisetteState == nil {
+            anisetteState = anisetteStore.load()
+        }
+
+        guard let state = anisetteState, !state.isEmpty else {
+            throw StoreAuthError.failure("Store AMD state is unavailable")
+        }
+
+        let identity = try currentMachineIdentity()
+        let proof = try StoreAMD.headers(
+            state: state,
+            endpoint: endpoint.absoluteString,
+            hardwareID: identity.hardwareID
+        )
+        try persistAnisetteState(proof.state)
+
+        for (key, value) in proof.headers {
+            request.setValue(value, forHTTPHeaderField: key)
+        }
+    }
+
+    /// 与 Go 侧白名单一致：只对已知的下载端点发送设备证明。
+    private func isStoreAMDCommerceURL(_ url: URL) -> Bool {
+        guard url.scheme == "https", url.user == nil, url.fragment == nil,
+              let host = url.host?.lowercased(),
+              url.port == nil || url.port == 443 else {
+            return false
+        }
+
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let items = components.queryItems,
+              items.count == 1,
+              items[0].name == "guid",
+              let guid = items[0].value, !guid.isEmpty else {
+            return false
+        }
+
+        if host == downloadDispatchDomain {
+            return [entDownloadPath, redownloadProductPath, updateProductPath].contains(url.path)
+        }
+
+        guard isStoreBuyHost(host) else {
+            return false
+        }
+
+        return url.path == privateAppStoreAPIPathDownload
+    }
+
+    private func isStoreBuyHost(_ host: String) -> Bool {
+        if host == privateAppStoreAPIDomain {
+            return true
+        }
+
+        let suffix = "-\(privateAppStoreAPIDomain)"
+        guard host.hasSuffix(suffix) else {
+            return false
+        }
+
+        let pod = String(host.dropLast(suffix.count))
+        guard pod.count >= 2, pod.first == "p" else {
+            return false
+        }
+
+        return pod.dropFirst().allSatisfy { $0 >= "0" && $0 <= "9" }
+    }
+
     // MARK: - Bag
 
     public func fetchBag() async throws -> SAPConfig {
@@ -352,9 +498,18 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
             throw AppStoreError.parseFailed
         }
 
-        var authComponents = URLComponents(url: authURL, resolvingAgainstBaseURL: false)
-        authComponents?.path = "/WebObjects/MZFinance.woa/wa/authenticate/"
-        let normalizedAuthURL = authComponents?.url ?? authURL
+        guard StoreAuthenticationEndpoint.isAllowed(authURL) else {
+            throw AppStoreError.invalidResponse
+        }
+
+        // 旧端点必须补上结尾斜杠，否则可能只返回 301 且没有 Location；
+        // 原生端点必须原样保留，改写路径会让 Apple 无法按预期路由。
+        var normalizedAuthURL = authURL
+        if !StoreAuthenticationEndpoint.isNative(authURL) {
+            var authComponents = URLComponents(url: authURL, resolvingAgainstBaseURL: false)
+            authComponents?.path = "/WebObjects/MZFinance.woa/wa/authenticate/"
+            normalizedAuthURL = authComponents?.url ?? authURL
+        }
 
         return SAPConfig(authEndpoint: normalizedAuthURL, certificateURL: certURL, setupURL: setupURL, version: version)
     }
@@ -391,8 +546,96 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
 
     // MARK: - Login
 
+    /// 登录。首次需要设备证明时完成机器预置；Apple 要求 RP（证明续签）
+    /// 或 SP（Store 预置）动作时在设备端闭环后再重放登录。
     public func login(email: String, password: String, code: String? = nil,
                       signer: SAPSigner, authEndpoint: URL, guid: String) async throws -> AccountInfo {
+        guard StoreAuthenticationEndpoint.isAllowed(authEndpoint) else {
+            throw AppStoreError.invalidResponse
+        }
+
+        let hardwareID = try hardwareID(forGUID: guid)
+        let endpoint = authEndpoint.absoluteString
+
+        if anisetteState == nil {
+            anisetteState = anisetteStore.load()
+        }
+
+        // 已完成的 Store 预置状态优先复用；证明失败时退回机器预置。
+        if let stored = anisetteState, !stored.isEmpty,
+           let proof = try? StoreAMD.headers(state: stored, endpoint: endpoint, hardwareID: hardwareID) {
+            try persistAnisetteState(proof.state)
+            authenticationHeaders = proof.headers
+            defer { authenticationHeaders = [:] }
+
+            return try await performLogin(
+                email: email, password: password, code: code,
+                signer: signer, authEndpoint: authEndpoint, guid: guid
+            )
+        }
+
+        let machine = try await AnisetteProvisioner.headers(state: anisetteState, session: session)
+        try persistAnisetteState(machine.state)
+        authenticationHeaders = machine.headers
+        defer { authenticationHeaders = [:] }
+
+        do {
+            return try await performLogin(
+                email: email, password: password, code: code,
+                signer: signer, authEndpoint: authEndpoint, guid: guid
+            )
+        } catch let error as AppStoreError {
+            guard case let .storeProvisioningRequired(action, _) = error, action == "RP" else {
+                throw error
+            }
+        }
+
+        // 证明续签：Apple 拒绝的是设备证明本身，去掉 AuthKit 头后重发，
+        // 由下一次响应决定是否需要 Store 预置。
+        removeAuthenticationHeaders(["X-Apple-I-MD", "X-Apple-I-MD-M", "X-Apple-I-MD-RINFO"])
+
+        let challenge: String
+        do {
+            return try await performLogin(
+                email: email, password: password, code: code,
+                signer: signer, authEndpoint: authEndpoint, guid: guid
+            )
+        } catch let error as AppStoreError {
+            guard case let .storeProvisioningRequired(action, data) = error, action == "SP" else {
+                throw error
+            }
+            challenge = data
+        }
+
+        let identity = try currentMachineIdentity()
+        guard let kbsync = generateKBSync(identity: identity,
+                                          directoryServicesID: AnisetteState.machineDSID) else {
+            throw AppStoreError.storeProvisioningFailed(message: "无法生成 Store 预置 kbsync")
+        }
+
+        let provisioned = try await StoreProvisioning.provision(
+            state: machine.state,
+            challenge: challenge,
+            kbsync: kbsync,
+            hardwareID: hardwareID,
+            identity: machine.headers,
+            session: session
+        )
+        try persistAnisetteState(provisioned)
+
+        let proof = try StoreAMD.headers(state: provisioned, endpoint: endpoint, hardwareID: hardwareID)
+        try persistAnisetteState(proof.state)
+        authenticationHeaders = proof.headers
+
+        return try await performLogin(
+            email: email, password: password, code: code,
+            signer: signer, authEndpoint: authEndpoint, guid: guid
+        )
+    }
+
+    /// 在当前 `authenticationHeaders` 下执行一次鉴权请求。
+    private func performLogin(email: String, password: String, code: String?,
+                              signer: SAPSigner, authEndpoint: URL, guid: String) async throws -> AccountInfo {
         let body: [String: Any] = [
             "appleId": email,
             "attempt": "1",
@@ -408,11 +651,12 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
         let signatureB64 = signature.base64EncodedString()
 
         var request = defaultRequest(authEndpoint, method: "POST")
-        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/x-apple-plist", forHTTPHeaderField: "Content-Type")
         request.setValue(signatureB64, forHTTPHeaderField: "X-Apple-ActionSignature")
         request.httpBody = bodyData
 
-        print("[login] POST \(authEndpoint.absoluteString)")
+        // “证明续签”后 AuthKit 头已被移除，这里按当时的头重新构造请求。
+        applyAuthenticationHeaders(to: &request)
 
         var currentRequest = request
         var data = Data()
@@ -429,6 +673,9 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
             if (300...399).contains(http.statusCode),
                let location = http.value(forHTTPHeaderField: "Location"),
                let redirectURL = URL(string: location, relativeTo: currentRequest.url) {
+                guard StoreAuthenticationEndpoint.isAllowed(redirectURL) else {
+                    throw AppStoreError.invalidResponse
+                }
                 currentRequest.url = redirectURL
                 currentRequest.httpBody = bodyData
                 continue
@@ -440,13 +687,21 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
             throw AppStoreError.invalidResponse
         }
 
+        // Apple 要求设备侧完成动作（SP = Store 预置，RP = 证明续签）时，正文里
+        // 没有 passwordToken，只有响应头说明原因。这里必须显式报错，否则会被
+        // 误判成密码错误。
+        if let action = httpResponse.value(forHTTPHeaderField: "X-Apple-AMD-Action"),
+           !action.trimmingCharacters(in: .whitespaces).isEmpty {
+            let challenge = httpResponse.value(forHTTPHeaderField: "X-Apple-AMD-Data") ?? ""
+            throw AppStoreError.storeProvisioningRequired(action: action, data: challenge)
+        }
+
         guard let dict = parsePlistResponse(data) else {
             throw AppStoreError.parseFailed
         }
 
-        if let failureType = dict["failureType"] as? String, !failureType.isEmpty {
-            let msg = dict["customerMessage"] as? String ?? failureType
-            print("[login] FAILURE: \(failureType) - \(msg)")
+        if let failureType = stringValue(dict["failureType"]), !failureType.isEmpty {
+            let msg = stringValue(dict["customerMessage"]) ?? failureType
             // -5000 (InvalidCredentials) 且未提供验证码时，通常表示需要 2FA
             if code == nil, failureType == "-5000" {
                 throw AppStoreError.requires2FA
@@ -455,13 +710,12 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
         }
 
         // customerMessage 为 BadLogin 且无验证码时也表示需要 2FA
-        if let customerMessage = dict["customerMessage"] as? String,
+        if let customerMessage = stringValue(dict["customerMessage"]),
            customerMessage.contains("BadLogin"), code == nil {
-            print("[login] BadLogin without code -> requires 2FA")
             throw AppStoreError.requires2FA
         }
 
-        guard let passwordToken = dict["passwordToken"] as? String, !passwordToken.isEmpty else {
+        guard let passwordToken = stringValue(dict["passwordToken"]), !passwordToken.isEmpty else {
             throw AppStoreError.loginFailed(message: "No password token in response")
         }
 
@@ -470,9 +724,9 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
         let pod = httpResponse.value(forHTTPHeaderField: "pod") ?? ""
 
         let accountInfo = dict["accountInfo"] as? [String: Any]
-        let firstName = accountInfo?["firstName"] as? String ?? ""
-        let lastName = accountInfo?["lastName"] as? String ?? ""
-        let dsid = dict["dsPersonId"] as? String ?? ""
+        let firstName = stringValue(accountInfo?["firstName"]) ?? ""
+        let lastName = stringValue(accountInfo?["lastName"]) ?? ""
+        let dsid = stringValue(dict["dsPersonId"]) ?? ""
 
         let acc = AccountInfo(
             email: email,
@@ -484,7 +738,6 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
         )
         self.account = acc
 
-        print("[login] SUCCESS: \(acc.name)")
         return acc
     }
 
@@ -846,6 +1099,8 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
         }
         request.httpBody = bodyData
 
+        try attachStoreAMDProof(to: &request, endpoint: url)
+
         let (data, response) = try await session.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
             throw AppStoreError.invalidResponse
@@ -1013,6 +1268,14 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
         request.setValue(account.directoryServicesID, forHTTPHeaderField: "iCloud-DSID")
         request.setValue(account.directoryServicesID, forHTTPHeaderField: "X-Dsid")
         request.httpBody = bodyData
+
+        // 证明生成失败时放弃本次 ent/download，让调用方回退到旧链路。
+        do {
+            try attachStoreAMDProof(to: &request, endpoint: endpoint)
+        } catch {
+            print("[ent] Store AMD proof failed: \(error)")
+            return nil
+        }
 
         guard let (data, response) = try? await noRedirectSession.data(for: request),
               let httpResponse = response as? HTTPURLResponse,
@@ -1753,6 +2016,8 @@ public enum AppStoreError: Error, LocalizedError {
     case parseFailed
     case loginFailed(message: String)
     case requires2FA
+    case storeProvisioningRequired(action: String, data: String)
+    case storeProvisioningFailed(message: String)
     case purchaseFailed(message: String)
     case downloadFailed(message: String)
     case notImplemented
@@ -1764,6 +2029,9 @@ public enum AppStoreError: Error, LocalizedError {
         case .parseFailed: return "解析响应失败"
         case .loginFailed(let msg): return "登录失败: \(msg)"
         case .requires2FA: return "需要双重认证验证码"
+        case .storeProvisioningRequired(let action, _):
+            return "该账号要求 Apple 设备端证明（AMD-Action: \(action)），设备端证明流程未能完成"
+        case .storeProvisioningFailed(let msg): return "Store 预置失败: \(msg)"
         case .purchaseFailed(let msg): return "购买失败: \(msg)"
         case .downloadFailed(let msg): return "下载失败: \(msg)"
         case .notImplemented: return "功能未实现"

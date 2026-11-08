@@ -5,6 +5,8 @@ module CSAP {
     header "shims.h"
     header "machine.h"
     header "storeagent.h"
+    header "anisette.h"
     header "bz2.h"
+    header "store_runtime.h"
     export *
 }

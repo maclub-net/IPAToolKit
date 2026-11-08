@@ -16,6 +16,7 @@ typedef int32_t     (*fn_uc_mem_read)(void* handle, uint64_t address, void* buff
 typedef int32_t     (*fn_uc_mem_write)(void* handle, uint64_t address, const void* buffer, uint64_t size);
 typedef int32_t     (*fn_uc_reg_read)(void* handle, int32_t regid, void* value);
 typedef int32_t     (*fn_uc_reg_write)(void* handle, int32_t regid, const void* value);
+typedef int32_t     (*fn_uc_ctl)(void* handle, uint32_t control, ...);
 typedef int32_t     (*fn_uc_emu_start)(void* handle, uint64_t begin, uint64_t end, uint64_t timeout, uint64_t count);
 typedef int32_t     (*fn_uc_emu_stop)(void* handle);
 typedef int32_t     (*fn_uc_hook_add)(void* handle, void** hook, int32_t type,
@@ -37,6 +38,7 @@ static struct {
     fn_uc_mem_write  mem_write;
     fn_uc_reg_read   reg_read;
     fn_uc_reg_write  reg_write;
+    fn_uc_ctl        ctl;
     fn_uc_emu_start  emu_start;
     fn_uc_emu_stop   emu_stop;
     fn_uc_hook_add   hook_add;
@@ -85,6 +87,9 @@ int csap_uc_load(const char* dylib_path) {
     RESOLVE(hook_del,   "uc_hook_del")
 
     #undef RESOLVE
+
+    // uc_ctl 是可选的（旧版 libunicorn 不导出）；缺失时 ARM64 CPU 型号保持默认。
+    g_uc_api.ctl = (fn_uc_ctl)dlsym(g_uc_api.handle, "uc_ctl");
 
     // 验证版本
     uint32_t major = 0, minor = 0;
@@ -154,6 +159,24 @@ int csap_uc_reg_read(csap_uc_engine_t* uc, int32_t regid, uint64_t* value) {
 
 int csap_uc_reg_write(csap_uc_engine_t* uc, int32_t regid, uint64_t value) {
     return g_uc_api.reg_write(uc->handle, regid, &value);
+}
+
+int csap_uc_reg_read128(csap_uc_engine_t* uc, int32_t regid, uint8_t value[16]) {
+    return g_uc_api.reg_read(uc->handle, regid, value);
+}
+
+int csap_uc_reg_write128(csap_uc_engine_t* uc, int32_t regid, const uint8_t value[16]) {
+    return g_uc_api.reg_write(uc->handle, regid, value);
+}
+
+int csap_uc_set_max_cpu_model(csap_uc_engine_t* uc) {
+    if (uc == NULL || g_uc_api.ctl == NULL) {
+        return -1;
+    }
+
+    // UC_CTL_CPU_MODEL = 7 | UC_CTL_FEATURE | UC_CTL_TYPE_DWORD，型号 3 为
+    // Unicorn 2.1 支持的最高 ARM64 型号。
+    return g_uc_api.ctl(uc->handle, (uint32_t)(7 | 1u << 26 | 1u << 30), (uint32_t)3);
 }
 
 int csap_uc_emu_start(csap_uc_engine_t* uc, uint64_t begin, uint64_t end, uint64_t timeout, uint64_t count) {
