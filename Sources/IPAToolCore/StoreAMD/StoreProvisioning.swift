@@ -64,6 +64,20 @@ final class StoreAssets {
 
         return root.appendingPathComponent(cacheDirectoryName, isDirectory: true).path
     }
+
+    /// 优先装载已有缓存；缺失时从固定 IPSW 补齐后再装载。
+    static func prepare(session: URLSession = .shared) async throws -> StoreAssets {
+        let directory = try cacheDirectory()
+        if let cached = try? StoreAssets(directory: directory) {
+            return cached
+        }
+
+        try await Task.detached(priority: .utility) {
+            try IPSWAssetInstaller.installIfNeeded(directory: directory, session: session)
+        }.value
+
+        return try StoreAssets(directory: directory)
+    }
 }
 
 // MARK: - Modern ADI
@@ -382,7 +396,7 @@ enum AnisetteProvisioner {
         state.provisioning = nil
         state.routingInfo = 0
 
-        let assets = try StoreAssets()
+        let assets = try await StoreAssets.prepare(session: session)
         let adi = try StoreADI(assets: assets, identifier: state.identifier)
         defer {
             adi.close()
@@ -484,7 +498,7 @@ enum StoreProvisioning {
             throw StoreAuthError.failure("decode Apple Store provisioning data")
         }
 
-        let assets = try StoreAssets()
+        let assets = try await StoreAssets.prepare(session: session)
         let adi = try StoreADI(assets: assets, identifier: state.identifier)
         defer {
             adi.close()
