@@ -926,7 +926,7 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
             "price": "0",
             "pricingParameters": pricingParameterAppStore,
             "productType": "C",
-            "salableAdamId": String(appID),
+            "salableAdamId": appID,
         ]
 
         let bodyData = try PropertyListSerialization.data(fromPropertyList: body, format: .xml, options: 0)
@@ -1083,7 +1083,7 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
         var body: [String: Any] = [
             "creditDisplay": "",
             "guid": guid,
-            "salableAdamId": String(appID),
+            "salableAdamId": appID,
             "serialNumber": "0",
         ]
         if let externalVersionID = externalVersionID {
@@ -1262,10 +1262,14 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
             return nil
         }
 
-        // X-Token 不允许跟随重定向，与 ipatool-go 一致使用不重定向的 session
+        // X-Token 不允许跟随重定向，与 ipatool-go 一致使用不重定向的 session。
+        // ent/download 只接受 Configurator 2.21 及以上客户端：用 2.18 的 UA 会被回 401，
+        // 因此这里与其余请求共用 defaultUserAgent。
         var request = defaultRequest(endpoint, method: "POST")
         request.setValue("application/x-www-form-urlencoded; charset=utf-8", forHTTPHeaderField: "Content-Type")
-        request.setValue("Configurator/2.18 (Macintosh; OS X 15.3.2; 24D81) AppleWebKit/0620.2.4.11.6", forHTTPHeaderField: "User-Agent")
+        request.setValue("en", forHTTPHeaderField: "Accept-Language")
+        request.setValue("0", forHTTPHeaderField: "X-Apple-Tz")
+        request.setValue("me.majd.ipatool", forHTTPHeaderField: "X-Apple-Client-Application")
         request.setValue(account.storeFront, forHTTPHeaderField: "X-Apple-Store-Front")
         request.setValue(account.passwordToken, forHTTPHeaderField: "X-Token")
         request.setValue(account.directoryServicesID, forHTTPHeaderField: "iCloud-DSID")
@@ -1280,36 +1284,40 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
             return nil
         }
 
-        guard let (data, response) = try? await noRedirectSession.data(for: request),
-              let httpResponse = response as? HTTPURLResponse,
-              httpResponse.statusCode == 200,
-              let dict = parsePlistResponse(data) else {
-            print("[ent] request failed or response unparsable")
-            return nil
-        }
+        do {
+            let (data, response) = try await noRedirectSession.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200,
+                  let dict = parsePlistResponse(data) else {
+                print("[ent] request failed or response unparsable")
+                return nil
+            }
 
-        if let failureType = dict["failureType"] as? String, !failureType.isEmpty {
-            print("[ent] failureType=\(failureType), msg=\(dict["customerMessage"] as? String ?? "-")")
-            return nil
-        }
-        if let message = dict["customerMessage"] as? String, !message.isEmpty {
-            print("[ent] customerMessage=\(message)")
-            return nil
-        }
+            if let failureType = dict["failureType"] as? String, !failureType.isEmpty {
+                print("[ent] failureType=\(failureType), msg=\(dict["customerMessage"] as? String ?? "-")")
+                return nil
+            }
+            if let message = dict["customerMessage"] as? String, !message.isEmpty {
+                print("[ent] customerMessage=\(message)")
+                return nil
+            }
 
-        // 响应必须唯一，且与请求的应用/版本/bundle 匹配，避免误用其他构建
-        guard let songList = dict["songList"] as? [Any], songList.count == 1,
-              let item = songList.first as? [String: Any],
-              let metadata = item["metadata"] as? [String: Any],
-              let itemID = stringValue(metadata["itemId"]), itemID == String(appID),
-              let returnedVersion = stringValue(metadata["softwareVersionExternalIdentifier"]),
-              returnedVersion == versionID,
-              let urlString = item["URL"] as? String, !urlString.isEmpty else {
-            print("[ent] response does not match the requested app or version")
+            // 响应必须唯一，且与请求的应用/版本/bundle 匹配，避免误用其他构建
+            guard let songList = dict["songList"] as? [Any], songList.count == 1,
+                  let item = songList.first as? [String: Any],
+                  let metadata = item["metadata"] as? [String: Any],
+                  let itemID = stringValue(metadata["itemId"]), itemID == String(appID),
+                  let returnedVersion = stringValue(metadata["softwareVersionExternalIdentifier"]),
+                  returnedVersion == versionID,
+                  let urlString = item["URL"] as? String, !urlString.isEmpty else {
+                print("[ent] response does not match the requested app or version: keys=\(dict.keys.sorted()) songList=\((dict["songList"] as? [Any])?.count ?? -1)")
+                return nil
+            }
+
+            return dict
+        } catch {
+            print("[ent] request error: \(error)")
             return nil
         }
-
-        return dict
     }
 
     /// 同一响应里同时含 iOS 与 macOS 包时，把 IPA 放到 songList 首位。
