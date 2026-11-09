@@ -1098,6 +1098,7 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
             request.setValue(account.directoryServicesID, forHTTPHeaderField: "iCloud-DSID")
             request.setValue(account.directoryServicesID, forHTTPHeaderField: "X-Dsid")
             request.setValue(account.passwordToken, forHTTPHeaderField: "X-Token")
+            request.setValue(account.storeFront, forHTTPHeaderField: "X-Apple-Store-Front")
         }
         request.httpBody = bodyData
 
