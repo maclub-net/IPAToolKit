@@ -1005,9 +1005,11 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
         }
 
         // 1. 尝试 volumeStoreDownloadProduct
+        // 只钉调用方显式指定的版本：自动解析出的版本号属于单一平台的 offer，
+        // 钉进 volumeStore 会拿到不含下载链接的响应（对齐 ipatool-go 的未钉版本请求）。
         let podPrefix = account.pod.isEmpty ? "" : "p\(account.pod)-"
         let volumeURL = URL(string: "https://\(podPrefix)\(privateAppStoreAPIDomain)\(privateAppStoreAPIPathDownload)?guid=\(identity.guid)")!
-        var volumeDict = try await sendDownloadRequest(url: volumeURL, appID: appID, guid: identity.guid, externalVersionID: resolvedVersionID, versionKey: "externalVersionId")
+        var volumeDict = try await sendDownloadRequest(url: volumeURL, appID: appID, guid: identity.guid, externalVersionID: externalVersionID, versionKey: "externalVersionId")
         // 首次响应：9610 (License not found) 需走购买流程获取授权，不立即失败；其他错误快速失败
         if let ft = volumeDict["failureType"] as? String, !ft.isEmpty, ft != "9610" {
             let msg = volumeDict["customerMessage"] as? String ?? ft
@@ -1026,7 +1028,7 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
             } catch {
                 print("[download] purchase failed: \(error.localizedDescription)")
             }
-            volumeDict = try await sendDownloadRequest(url: volumeURL, appID: appID, guid: identity.guid, externalVersionID: resolvedVersionID, versionKey: "externalVersionId")
+            volumeDict = try await sendDownloadRequest(url: volumeURL, appID: appID, guid: identity.guid, externalVersionID: externalVersionID, versionKey: "externalVersionId")
             try throwIfDownloadFailed(volumeDict)
         }
 
