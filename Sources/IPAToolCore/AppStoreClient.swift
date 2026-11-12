@@ -1595,8 +1595,32 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
         return url
     }
 
-    /// 下载文件到指定路径，支持进度回调
-    public func downloadFile(from url: URL, to destination: URL, progress: @escaping (Double) -> Void) async throws {
+    /// 下载文件到指定路径，支持进度回调。
+    ///
+    /// - Parameter concurrency: 并发连接数。大于 1 时使用分段 Range 下载；
+    ///   服务器不支持 Range 或文件过小时自动回退为单连接。
+    public func downloadFile(from url: URL,
+                             to destination: URL,
+                             concurrency: Int = 1,
+                             progress: @escaping (Double) -> Void) async throws {
+        if concurrency > 1 {
+            do {
+                try await SegmentedDownloader().download(from: url,
+                                                         to: destination,
+                                                         concurrency: concurrency,
+                                                         progress: progress)
+                return
+            } catch SegmentedDownloader.DownloadError.rangeUnsupported {
+                // 回退到单连接下载。
+            }
+        }
+
+        try await downloadFileSingleStream(from: url, to: destination, progress: progress)
+    }
+
+    private func downloadFileSingleStream(from url: URL,
+                                          to destination: URL,
+                                          progress: @escaping (Double) -> Void) async throws {
         let (asyncBytes, response) = try await session.bytes(from: url)
         guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
             throw AppStoreError.downloadFailed(message: "下载失败：HTTP \((response as? HTTPURLResponse)?.statusCode ?? -1)")
@@ -1680,6 +1704,7 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
     public func downloadMacPackage(from url: URL, to destination: URL,
                                    hardwareID: Data, dpInfo: Data,
                                    assets: SAPAssets,
+                                   concurrency: Int = 1,
                                    progress: @escaping (Double) -> Void) async throws {
         let fm = FileManager.default
         let encryptedPath = destination.path + ".ipatool-encrypted"
@@ -1700,7 +1725,7 @@ public class AppStoreClient: NSObject, URLSessionTaskDelegate {
 
         // 1. 下载加密包到临时路径
         let encryptedURL = URL(fileURLWithPath: encryptedPath)
-        try await downloadFile(from: url, to: encryptedURL, progress: progress)
+        try await downloadFile(from: url, to: encryptedURL, concurrency: concurrency, progress: progress)
 
         // 2. 打开 StoreAgent 解密器
         let decrypter = SAPSigner.StoreAgentDecrypter(assets: assets)
